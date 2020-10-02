@@ -79,8 +79,9 @@ type Entry struct {
 	Mandatory   TriState  `json:",omitempty"` // whether this entry is mandatory in the tree
 
 	// Fields associated with directory nodes
-	Dir map[string]*Entry `json:",omitempty"`
-	Key string            `json:",omitempty"` // Optional key name for lists (i.e., maps)
+	Dir         map[string]*Entry `json:",omitempty"`
+	PrefixedDir map[string]*Entry `json:"-"`
+	Key         string            `json:",omitempty"` // Optional key name for lists (i.e., maps)
 
 	// Fields associated with leaf nodes
 	Type *YangType    `json:",omitempty"`
@@ -262,11 +263,12 @@ func (k EntryKind) String() string {
 // newDirectory returns an empty directory Entry.
 func newDirectory(n Node) *Entry {
 	return &Entry{
-		Kind:  DirectoryEntry,
-		Dir:   make(map[string]*Entry),
-		Node:  n,
-		Name:  n.NName(),
-		Extra: map[string][]interface{}{},
+		Kind:        DirectoryEntry,
+		Dir:         make(map[string]*Entry),
+		PrefixedDir: make(map[string]*Entry),
+		Node:        n,
+		Name:        n.NName(),
+		Extra:       map[string][]interface{}{},
 	}
 }
 
@@ -313,7 +315,7 @@ func (e *Entry) importErrors(c *Entry) {
 	// for _, ce := range e.Exts {
 	// 	e.importErrors(ce)
 	// }
-	for _, ce := range c.Dir {
+	for _, ce := range c.PrefixedDir {
 		e.importErrors(ce)
 	}
 }
@@ -323,7 +325,7 @@ func (e *Entry) checkErrors(f func(error)) {
 	if e == nil {
 		return
 	}
-	for _, e := range e.Dir {
+	for _, e := range e.PrefixedDir {
 		e.checkErrors(f)
 	}
 	for _, err := range e.Errors {
@@ -355,6 +357,12 @@ func (e *Entry) GetErrors() []error {
 // add adds the directory entry key assigned to the provided value.
 func (e *Entry) add(key string, value *Entry) *Entry {
 	value.Parent = e
+	if e.PrefixedDir[e.getPrefixedName(key)] != nil {
+		e.errorf("%s: duplicate key from %s: %s", Source(e.Node), Source(value.Node), key)
+		return e
+	}
+	e.PrefixedDir[e.getPrefixedName(key)] = value
+
 	if e.Dir[key] != nil {
 		e.errorf("%s: duplicate key from %s: %s", Source(e.Node), Source(value.Node), key)
 		return e
@@ -365,10 +373,34 @@ func (e *Entry) add(key string, value *Entry) *Entry {
 
 // delete removes the directory entry key from the entry.
 func (e *Entry) delete(key string) {
+	if _, ok := e.PrefixedDir[e.getPrefixedName(key)]; !ok {
+		e.errorf("%s: unknown child key %s", Source(e.Node), key)
+	}
+	delete(e.PrefixedDir, e.getPrefixedName(key))
+
 	if _, ok := e.Dir[key]; !ok {
 		e.errorf("%s: unknown child key %s", Source(e.Node), key)
 	}
 	delete(e.Dir, key)
+
+	// If there's still an entry left in PrefixedDir, use it for Dir
+	for k, v := range e.PrefixedDir {
+		if _, name := getPrefix(k); name == key {
+			e.Dir[name] = v
+			break
+		}
+	}
+}
+
+func (e *Entry) getPrefixedName(key string) string {
+	prefix := ""
+	if e.Node != nil {
+		prefix = RootNode(e.Node).GetPrefix()
+	}
+	if prefix == "" {
+		return key
+	}
+	return prefix + ":" + key
 }
 
 // GetWhenXPath returns the when XPath statement of e if able.
@@ -577,6 +609,15 @@ func ToEntry(n Node) (e *Entry) {
 		// when the group is used in multiple locations and the
 		// grouping has a leafref that references outside the group.
 		e := ToEntry(g).dup()
+
+		// Per https://tools.ietf.org/html/rfc7950#section-7.12:
+		// The identifiers defined in the grouping are not bound to a namespace
+		// until the contents of the grouping are added to the schema tree via a
+		// "uses" statement that does not appear inside a "grouping" statement,
+		// at which point they are bound to the namespace of the current module.
+		newPrefix := RootNode(n).GetPrefix()
+		updatePrefixes(e, newPrefix)
+
 		addExtraKeywordsToLeafEntry(n, e)
 		return e
 	}
@@ -937,6 +978,19 @@ func ToEntry(n Node) (e *Entry) {
 	return e
 }
 
+func updatePrefixes(e *Entry, newPrefix string) {
+	for k, v := range e.PrefixedDir {
+		parts := strings.Split(k, ":")
+		newKey := newPrefix + ":" + parts[1]
+		if k != newKey {
+			e.PrefixedDir[newKey] = v
+			delete(e.PrefixedDir, k)
+		}
+
+		updatePrefixes(v, newPrefix)
+	}
+}
+
 // addExtraKeywordsToLeafEntry stores the values for unimplemented keywords in leaf entries.
 func addExtraKeywordsToLeafEntry(n Node, e *Entry) {
 	v := reflect.ValueOf(n).Elem()
@@ -1089,7 +1143,7 @@ func (e *Entry) ApplyDeviate() []error {
 // FixChoice inserts missing Case entries in a choice
 func (e *Entry) FixChoice() {
 	if e.Kind == ChoiceEntry && len(e.Errors) == 0 {
-		for k, ce := range e.Dir {
+		for k, ce := range e.PrefixedDir {
 			if ce.Kind != CaseEntry {
 				ne := &Entry{
 					Parent: e,
@@ -1099,19 +1153,22 @@ func (e *Entry) FixChoice() {
 						Source:     ce.Node.Statement(),
 						Extensions: ce.Node.Exts(),
 					},
-					Name:   ce.Name,
-					Kind:   CaseEntry,
-					Config: ce.Config,
-					Prefix: ce.Prefix,
-					Dir:    map[string]*Entry{ce.Name: ce},
-					Extra:  map[string][]interface{}{},
+					Name:        ce.Name,
+					Kind:        CaseEntry,
+					Config:      ce.Config,
+					Prefix:      ce.Prefix,
+					Dir:         map[string]*Entry{ce.Name: ce},
+					PrefixedDir: map[string]*Entry{e.getPrefixedName(ce.Name): ce},
+					Extra:       map[string][]interface{}{},
 				}
 				ce.Parent = ne
-				e.Dir[k] = ne
+				e.PrefixedDir[k] = ne
+				_, name := getPrefix(k)
+				e.Dir[name] = ne
 			}
 		}
 	}
-	for _, ce := range e.Dir {
+	for _, ce := range e.PrefixedDir {
 		ce.FixChoice()
 	}
 }
@@ -1140,36 +1197,44 @@ func (e *Entry) Find(name string) *Entry {
 	}
 	parts := strings.Split(name, "/")
 
+	// Find the module in which the augment is defined.
+	mod := e
+	for mod.Parent != nil {
+		mod = mod.Parent
+	}
+
+	// The prefix to use for an unprefixed path part. Defaults to the prefix for the module in which the
+	// statement is defined.
+	defaultPrefix := mod.Node.(*Module).GetPrefix()
+
+	// Since this module might use a different prefix that isn't
+	// the prefix that the module itself uses then we need to resolve
+	// the module into its local prefix to find it.
+	pfxMap := map[string]string{
+		// Seed the map with the local module - we use GetPrefix just
+		// in case the module is a submodule.
+		mod.Node.(*Module).GetPrefix(): mod.Prefix.Name,
+	}
+
+	// Add a map between the prefix used in the import statement, and
+	// the prefix that is used in the module itself.
+	for _, i := range mod.Node.(*Module).Import {
+		// Resolve the module using the current module set, since we may
+		// not have populated the Module for the entry yet.
+		m, ok := mod.Node.(*Module).modules.Modules[i.Name]
+		if !ok {
+			e.addError(fmt.Errorf("cannot find a module with name %s when looking at imports in %s", i.Name, e.Path()))
+			return nil
+		}
+
+		pfxMap[i.Prefix.Name] = m.Prefix.Name
+	}
+
 	// If parts[0] is "" then this path started with a /
 	// and we need to find our parent.
 	if parts[0] == "" {
-		for e.Parent != nil {
-			e = e.Parent
-		}
+		e = mod
 		parts = parts[1:]
-
-		// Since this module might use a different prefix that isn't
-		// the prefix that the module itself uses then we need to resolve
-		// the module into its local prefix to find it.
-		pfxMap := map[string]string{
-			// Seed the map with the local module - we use GetPrefix just
-			// in case the module is a submodule.
-			e.Node.(*Module).GetPrefix(): e.Prefix.Name,
-		}
-
-		// Add a map between the prefix used in the import statement, and
-		// the prefix that is used in the module itself.
-		for _, i := range e.Node.(*Module).Import {
-			// Resolve the module using the current module set, since we may
-			// not have populated the Module for the entry yet.
-			m, ok := e.Node.(*Module).modules.Modules[i.Name]
-			if !ok {
-				e.addError(fmt.Errorf("cannot find a module with name %s when looking at imports in %s", i.Name, e.Path()))
-				return nil
-			}
-
-			pfxMap[i.Prefix.Name] = m.Prefix.Name
-		}
 
 		if prefix, _ := getPrefix(parts[0]); prefix != "" {
 			pfx, ok := pfxMap[prefix]
@@ -1206,13 +1271,25 @@ func (e *Entry) Find(name string) *Entry {
 				e = e.RPC.Output
 			}
 		default:
-			_, part = getPrefix(part)
+			prefix := defaultPrefix
+			if strings.Contains(part, ":") {
+				prefix, part = getPrefix(part)
+			}
+
 			switch part {
 			case ".":
 			case "", "..":
 				return nil
 			default:
-				e = e.Dir[part]
+				if prefix != "" {
+					pfx, ok := pfxMap[prefix]
+					if !ok {
+						e.addError(fmt.Errorf("invalid module prefix %s within module %s, defined prefix map: %v", prefix, e.Name, pfxMap))
+						return nil
+					}
+					part = pfx + ":" + part
+				}
+				e = e.PrefixedDir[part]
 			}
 		}
 	}
@@ -1279,15 +1356,19 @@ func (e *Entry) shallowDup() *Entry {
 	// copied we will have to explicitly uncopy them.
 	ne := *e
 
-	// Now only copy direct children, clear their Dir, and fix up
+	// Now only copy direct children, clear their PrefixedDir/Dir, and fix up
 	// Parent pointers.
-	if e.Dir != nil {
+	if e.PrefixedDir != nil {
+		ne.PrefixedDir = make(map[string]*Entry, len(e.PrefixedDir))
 		ne.Dir = make(map[string]*Entry, len(e.Dir))
-		for k, v := range e.Dir {
+		for k, v := range e.PrefixedDir {
 			de := *v
+			de.PrefixedDir = nil
 			de.Dir = nil
 			de.Parent = &ne
-			ne.Dir[k] = &de
+			ne.PrefixedDir[k] = &de
+			_, name := getPrefix(k)
+			ne.Dir[name] = &de
 		}
 	}
 	return &ne
@@ -1304,23 +1385,26 @@ func (e *Entry) dup() *Entry {
 
 	// Now recurse down to all of our children, fixing up Parent
 	// pointers as we go.
-	if e.Dir != nil {
+	if e.PrefixedDir != nil {
+		ne.PrefixedDir = make(map[string]*Entry, len(e.PrefixedDir))
 		ne.Dir = make(map[string]*Entry, len(e.Dir))
-		for k, v := range e.Dir {
+		for k, v := range e.PrefixedDir {
 			de := v.dup()
 			de.Parent = &ne
-			ne.Dir[k] = de
+			ne.PrefixedDir[k] = de
+			_, name := getPrefix(k)
+			ne.Dir[name] = de
 		}
 	}
 	return &ne
 }
 
-// merge merges a duplicate of oe.Dir into e.Dir, setting the prefix of each
+// merge merges a duplicate of oe.(Prefixed)Dir into e.(Prefixed)Dir, setting the prefix of each
 // element to prefix, if not nil.  It is an error if e and oe contain common
 // elements.
 func (e *Entry) merge(prefix *Value, namespace *Value, oe *Entry) {
 	e.importErrors(oe)
-	for k, v := range oe.Dir {
+	for k, v := range oe.PrefixedDir {
 		v := v.dup()
 		if prefix != nil {
 			v.Prefix = prefix
@@ -1328,7 +1412,7 @@ func (e *Entry) merge(prefix *Value, namespace *Value, oe *Entry) {
 		if namespace != nil {
 			v.namespace = namespace
 		}
-		if se := e.Dir[k]; se != nil {
+		if se := e.PrefixedDir[k]; se != nil {
 			er := newError(oe.Node, `Duplicate node %q in %q from:
    %s: %s
    %s: %s`, k, e.Name, Source(v.Node), v.Name, Source(se.Node), se.Name)
@@ -1336,7 +1420,9 @@ func (e *Entry) merge(prefix *Value, namespace *Value, oe *Entry) {
 		} else {
 			v.Parent = e
 			v.Exts = append(v.Exts, oe.Exts...)
-			e.Dir[k] = v
+			e.PrefixedDir[k] = v
+			_, name := getPrefix(k)
+			e.Dir[name] = v
 		}
 	}
 }

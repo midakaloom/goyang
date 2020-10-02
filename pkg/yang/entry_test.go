@@ -2254,9 +2254,6 @@ func TestEntryFind(t *testing.T) {
 			"../other":         "/test/other",
 			"/other":           "/test/other",
 			"/foo:bar/foo:baz": "/foo/bar/baz",
-			// Technically partially prefixed paths to remote modules are
-			// not legal - check whether we can resolve them.
-			"/foo:bar/baz": "/foo/bar/baz",
 			// With mismatched prefixes.
 			"/baz:fish/baz:chips": "/bar/fish/chips",
 			// With conflicting node names
@@ -2587,6 +2584,18 @@ func TestFixChoice(t *testing.T) {
 			},
 		},
 	}
+
+	var addPrefixedDir func(e *Entry)
+	addPrefixedDir = func(e *Entry) {
+		if e.PrefixedDir == nil {
+			e.PrefixedDir = make(map[string]*Entry)
+		}
+		for k, v := range e.Dir {
+			e.PrefixedDir["t:"+k] = v
+			addPrefixedDir(v)
+		}
+	}
+	addPrefixedDir(choiceEntry)
 
 	choiceEntry.FixChoice()
 
