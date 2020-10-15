@@ -372,11 +372,12 @@ func (e *Entry) add(key string, value *Entry) *Entry {
 }
 
 // delete removes the directory entry key from the entry.
-func (e *Entry) delete(key string) {
-	if _, ok := e.PrefixedDir[e.getPrefixedName(key)]; !ok {
-		e.errorf("%s: unknown child key %s", Source(e.Node), key)
+func (e *Entry) delete(prefix, key string) {
+	prefixedKey := prefix + ":" + key
+	if _, ok := e.PrefixedDir[prefixedKey]; !ok {
+		e.errorf("%s: unknown child key %s", Source(e.Node), prefixedKey)
 	}
-	delete(e.PrefixedDir, e.getPrefixedName(key))
+	delete(e.PrefixedDir, prefixedKey)
 
 	if _, ok := e.Dir[key]; !ok {
 		e.errorf("%s: unknown child key %s", Source(e.Node), key)
@@ -1116,7 +1117,18 @@ func (e *Entry) ApplyDeviate() []error {
 						appendErr(fmt.Errorf("%s: node %s does not have a valid parent, but deviate not-supported references one", Source(e.Node), e.Name))
 						continue
 					}
-					dp.delete(deviatedNode.Name)
+
+					// Find the correct prefix for the deviatedNode.
+					// It's not necessarily RootNode(deviatedNode.Node).GetPrefix(), because RootNode() will return
+					// the module where a grouping is defined, not where it is used.
+					ns := deviatedNode.Namespace()
+					mod, err := deviatedNode.Modules().FindModuleByNamespace(ns.Name)
+					if err != nil {
+						appendErr(fmt.Errorf("%s: could not determine prefix of deviated node %s", Source(e.Node), e.Name))
+						continue
+					}
+
+					dp.delete(mod.GetPrefix(), deviatedNode.Name)
 				case DeviationDelete:
 					if devSpec.Config != TSUnset {
 						deviatedNode.Config = TSUnset
